@@ -28,6 +28,16 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
 
     const file = cloudEvent.data;
 
+    // 1. Parse and validate ID first to avoid wasting quota/compute
+    const itemID = parseInt(path.parse(file.name).name);
+    if (isNaN(itemID)) {
+        console.log(`Skipping non-menu file: ${file.name}`);
+        return;
+    }
+
+    const originalFile = `/tmp/original/${file.name}`;
+    const thumbFile = `/tmp/thumbnail/${file.name}`;
+
     try {
         console.log(`Received thumbnail request for file ${file.name} from bucket ${file.bucket}`);
 
@@ -35,6 +45,7 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
         const bucket = storage.bucket(file.bucket);
         const thumbBucket = storage.bucket(process.env.BUCKET_THUMBNAILS);
 
+        // 2. Start Vision API Call
         const client = new vision.ImageAnnotatorClient();
         const visionRequest = {
             image: { source: { imageUri: `gs://${file.bucket}/${file.name}` } },
@@ -42,33 +53,22 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
                 { type: 'LABEL_DETECTION' },
             ]
         };
-        // We launch the vision call first so we can process the thumbnail while we wait for the response.
         const visionPromise = client.annotateImage(visionRequest);
 
-        if (!fs.existsSync("/tmp/original")){
-            fs.mkdirSync("/tmp/original");
-        }
-        if (!fs.existsSync("/tmp/thumbnail")){
-            fs.mkdirSync("/tmp/thumbnail");
-        }
+        // 3. Recursive directory creation for nested files
+        fs.mkdirSync(path.dirname(originalFile), { recursive: true });
+        fs.mkdirSync(path.dirname(thumbFile), { recursive: true });
 
-        const originalFile = `/tmp/original/${file.name}`;
-        const thumbFile = `/tmp/thumbnail/${file.name}`
-
+        // 4. Download file
         await bucket.file(file.name).download({
             destination: originalFile
         });
 
-        const originalImageUrl = await bucket.file(file.name).publicUrl()
+        const originalImageUrl = await bucket.file(file.name).publicUrl();
 
         console.log(`Downloaded picture into ${originalFile}`);
 
-        const itemID = parseInt(path.parse(file.name).name);
-
-        if (isNaN(itemID)){
-            return;
-        }
-
+        // 5. Crop and Resize
         const resizeCrop = Promise.promisify(imageMagick.crop);
         await resizeCrop({
             srcPath: originalFile,
@@ -78,20 +78,27 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
         });
         console.log(`Created local thumbnail in ${thumbFile}`);
 
+        // 6. Upload thumbnail
         const thumbnailImage = await thumbBucket.upload(thumbFile);
         const thumbnailImageUrl = thumbnailImage[0].publicUrl();
         console.log(`Uploaded thumbnail to Cloud Storage bucket ${process.env.BUCKET_THUMBNAILS}`);
+
+        // 7. Resolve Vision API with safety check
         const visionResponse = await visionPromise;
         console.log(`Raw vision output for: ${file.name}: ${JSON.stringify(visionResponse[0])}`);
-        let status = "Failed"
+        let status = "Failed";
         let labels = "";
-        for (const label of visionResponse[0].labelAnnotations){
-            status = label.description == "Food" ? "Ready" : status
-            labels = labels.concat(label.description, ", ");
+        const annotations = visionResponse[0] && visionResponse[0].labelAnnotations;
+        if (annotations) {
+            for (const label of annotations) {
+                status = label.description == "Food" ? "Ready" : status;
+                labels = labels.concat(label.description, ", ");
+            }
         }
         console.log(`\nVision API labels: ${labels}\n`);
         console.log(`Menu Item status will be set to: ${status}\n`);
 
+        // 8. Update database
         const menuServer = axios.create({
             baseURL: process.env.MENU_SERVICE_URL,
             headers :{
@@ -99,10 +106,10 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
                     "Content-Type": 'application/json'
                 }
             }
-        })
+        });
         const item = await menuServer.get(`/menu/${itemID}`);
         // Send update call to menu service
-        const request = await menuServer.put(`/menu/${itemID}`, {
+        await menuServer.put(`/menu/${itemID}`, {
             itemImageURL: originalImageUrl,
             itemName: item.data.itemName,
             itemPrice: item.data.itemPrice,
@@ -110,9 +117,17 @@ functions.cloudEvent('process-thumbnails', async (cloudEvent) => {
             spiceLevel: item.data.spiceLevel,
             status: status,
             tagLine: item.data.tagLine
-
-        })
+        });
     } catch (err) {
-        console.log(`Error: processing the thumbnail: ${err}`);
+        console.log(`Error processing the thumbnail: ${err}`);
+    } finally {
+        // 9. Clean up temp files to prevent OOM/disk-full crashes
+        try {
+            if (fs.existsSync(originalFile)) fs.unlinkSync(originalFile);
+            if (fs.existsSync(thumbFile)) fs.unlinkSync(thumbFile);
+            console.log('Temporary local workspace files cleaned up.');
+        } catch (cleanupError) {
+            console.log(`Error cleaning up temp files: ${cleanupError}`);
+        }
     }
 });
